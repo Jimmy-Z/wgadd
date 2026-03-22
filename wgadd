@@ -1,0 +1,107 @@
+#!/bin/sh
+
+IFACE=$1
+NAME=$2
+ADDR=$3
+EXEC=$4
+
+if test -z "$IFACE" -o -z "$NAME" -o -z "$ADDR"; then
+	echo "usage:"
+	echo "\twgadd <iface> <name> <addr> exec"
+	echo "\t\tiface: expect wg-quick style conf at /etc/wireguard/$iface.conf,"
+	echo "\t\t\tand it will be modified."
+	echo "\t\tname:  used for note/comment, and name for the new peer conf."
+	echo "\t\taddr:  last number of peer address."
+	echo "\t\texec:  write conf files if set, otherwise dry-run(output to stdout)."
+	exit 255
+fi
+
+CONF="/etc/wireguard/$IFACE.conf"
+
+S_ADDR=$(grep '^Address\s*=\s*' "$CONF" | sed 's/^Address\s*=\s*//')
+S_PRIK=$(grep '^PrivateKey\s*=\s*' "$CONF" | sed 's/^PrivateKey\s*=\s*//')
+if test x"$S_ADDR" = x; then
+	echo "failed to read Address from $CONF"
+	exit 254
+fi
+# echo "local address is $S_ADDR"
+if test x"$S_PRIK" = x; then
+	echo "failed to read PrivateKey from $CONF"
+	exit 254
+fi
+# prevent leaking private key in ps
+S_PUBK=$(wg pubkey <<EOF
+$S_PRIK
+EOF
+)
+
+MTU=$(grep '^MTU\s*=\s*' "$CONF" | sed 's/^MTU\s*=\s*//')
+
+CIDR=24
+S_CIDR=$(echo $S_ADDR |\
+	sed 's/[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\/\([0-9]\{1,2\}\)/\1/')
+if test x"$S_CIDR" != x$CIDR; then
+	echo "expect CIDR to be \"$CIDR\", got \"$S_CIDR\""
+	exit 254
+fi
+# strip cidr
+S_ADDR=$(echo $S_ADDR |\
+	sed 's/\([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\)\/[0-9]\{1,2\}/\1/')
+
+NET=$(echo $S_ADDR |\
+	sed 's/\([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\)\.[0-9]\{1,3\}/\1/')
+ADDR="$NET.$ADDR"
+
+PRIK=$(wg genkey)
+PUBK=$(wg pubkey <<EOF
+$PRIK
+EOF
+)
+PSK=$(wg genpsk)
+
+new_peer() {
+	echo '[Peer]'
+	echo "# $NAME"
+	echo "PresharedKey = $PSK"
+	echo "PublicKey = $PUBK"
+	echo "AllowedIPs = $ADDR"
+	echo ""
+}
+
+new_conf() {
+	echo '[Interface]'
+	echo "PrivateKey = $PRIK"
+	echo "Address = $ADDR/$CIDR"
+	echo "DNS = $S_ADDR"
+	if test x"$MTU" != x; then
+		echo "MTU = $MTU"
+	fi
+	echo ""
+	echo '[Peer]'
+	echo "PresharedKey = $PSK"
+	echo "PublicKey = $S_PUBK"
+	echo "AllowedIPs = 0.0.0.0/0, $S_ADDR"
+	echo "PersistentKeepalive = 23"
+	echo ""
+}
+
+if test x"$EXEC" != xexec; then
+	echo "dry-run"
+	echo "=== >> $CONF ==="
+	new_peer
+
+	echo "=== $NAME.conf ==="
+	new_conf
+else
+	echo "append to $CONF"
+	new_peer >>$CONF
+	echo "sync new peer to $IFACE"
+	# pity syncconf doesn't support -, thankfully /dev/stdin works
+	wg-quick strip $CONF | wg syncconf $IFACE /dev/stdin
+	echo "write new conf to $NAME.conf"
+	new_conf >$NAME.conf
+	if command -v qrencode >/dev/null 2>&1; then
+		qrencode -t utf8 -r $NAME.conf
+	fi
+fi
+
